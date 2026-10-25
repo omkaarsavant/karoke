@@ -309,7 +309,8 @@ function Sing() {
         {rec.status === "stopped" && rec.blob && recStartRef.current && (
           <ExportPanel
             instrumentalUrl={song.audioUrl}
-            vocal={rec.blob}
+            vocalStemUrl={song.vocalUrl}
+            microphoneTake={rec.blob}
             offset={recStartRef.current.offset}
             title={song.title}
             onDiscard={rec.reset}
@@ -354,72 +355,103 @@ function StatusNote({
 
 function ExportPanel({
   instrumentalUrl,
-  vocal,
+  vocalStemUrl,
+  microphoneTake,
   offset,
   title,
   onDiscard,
 }: {
   instrumentalUrl: string;
-  vocal: Blob;
+  vocalStemUrl?: string;
+  microphoneTake: Blob;
   offset: number;
   title: string;
   onDiscard: () => void;
 }) {
   const [instGain, setInstGain] = useState(0.8);
-  const [vocGain, setVocGain] = useState(1);
+  const [stemGain, setStemGain] = useState(0.7);
+  const [micGain, setMicGain] = useState(1);
   const [previewing, setPreviewing] = useState(false);
   const [progress, setProgress] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const vocalUrl = useRef("");
-  const pair = useRef<{ i: HTMLAudioElement; v: HTMLAudioElement } | null>(null);
+  const microphoneUrl = useRef("");
+  const pair = useRef<{
+    instrumental: HTMLAudioElement;
+    microphone: HTMLAudioElement;
+    vocalStem?: HTMLAudioElement;
+  } | null>(null);
 
-  if (!vocalUrl.current) vocalUrl.current = URL.createObjectURL(vocal);
+  if (!microphoneUrl.current) microphoneUrl.current = URL.createObjectURL(microphoneTake);
   useEffect(
     () => () => {
-      pair.current?.i.pause();
-      pair.current?.v.pause();
-      URL.revokeObjectURL(vocalUrl.current);
+      pair.current?.instrumental.pause();
+      pair.current?.microphone.pause();
+      pair.current?.vocalStem?.pause();
+      URL.revokeObjectURL(microphoneUrl.current);
     },
     [],
   );
   useEffect(() => {
     if (pair.current) {
-      pair.current.i.volume = Math.min(1, instGain);
-      pair.current.v.volume = Math.min(1, vocGain);
+      pair.current.instrumental.volume = Math.min(1, instGain);
+      pair.current.microphone.volume = Math.min(1, micGain);
+      if (pair.current.vocalStem) pair.current.vocalStem.volume = Math.min(1, stemGain);
     }
-  }, [instGain, vocGain]);
+  }, [instGain, micGain, stemGain]);
 
   const togglePreview = async () => {
     if (pair.current) {
-      pair.current.i.pause();
-      pair.current.v.pause();
+      pair.current.instrumental.pause();
+      pair.current.microphone.pause();
+      pair.current.vocalStem?.pause();
       pair.current = null;
       return setPreviewing(false);
     }
-    const i = new Audio(instrumentalUrl);
-    const v = new Audio(vocalUrl.current);
-    i.volume = Math.min(1, instGain);
-    v.volume = Math.min(1, vocGain);
-    i.currentTime = offset;
-    v.onended = () => {
-      i.pause();
+    const instrumental = new Audio(instrumentalUrl);
+    const microphone = new Audio(microphoneUrl.current);
+    const vocalStem = vocalStemUrl ? new Audio(vocalStemUrl) : undefined;
+    instrumental.volume = Math.min(1, instGain);
+    microphone.volume = Math.min(1, micGain);
+    instrumental.currentTime = offset;
+    if (vocalStem) {
+      vocalStem.volume = Math.min(1, stemGain);
+      vocalStem.currentTime = offset;
+    }
+    microphone.onended = () => {
+      instrumental.pause();
+      vocalStem?.pause();
       pair.current = null;
       setPreviewing(false);
     };
-    pair.current = { i, v };
+    pair.current = { instrumental, microphone, vocalStem };
     setPreviewing(true);
-    await Promise.all([i.play(), v.play()]);
+    try {
+      await Promise.all([instrumental.play(), microphone.play(), vocalStem?.play()]);
+    } catch (error) {
+      instrumental.pause();
+      microphone.pause();
+      vocalStem?.pause();
+      pair.current = null;
+      setPreviewing(false);
+      setErr(`Couldn't preview the mix: ${(error as Error).message}`);
+    }
   };
 
   const exportMp3 = async () => {
     setErr(null);
     setProgress(0);
     try {
-      const mixed = await mixTracks(instrumentalUrl, vocal, {
-        instrumentalGain: instGain,
-        vocalGain: vocGain,
-        vocalOffset: offset,
-      });
+      const mixed = await mixTracks(
+        instrumentalUrl,
+        microphoneTake,
+        {
+          instrumentalGain: instGain,
+          vocalStemGain: stemGain,
+          microphoneGain: micGain,
+          vocalOffset: offset,
+        },
+        vocalStemUrl,
+      );
       const mp3 = await encodeMp3(mixed, 192, setProgress);
       downloadBlob(mp3, `${title.replace(/\s+/g, "-").toLowerCase()}-karaoke.mp3`);
     } catch (e) {
@@ -435,12 +467,12 @@ function ExportPanel({
         <h2 className="font-display text-base font-semibold">Your take</h2>
         <audio
           controls
-          src={vocalUrl.current}
+          src={microphoneUrl.current}
           className="h-9 max-w-full"
-          aria-label="Raw vocal recording"
+          aria-label="Raw microphone recording"
         />
       </div>
-      <div className="grid gap-4 sm:grid-cols-2">
+      <div className="grid gap-4 sm:grid-cols-3">
         <label className="text-sm text-muted-foreground">
           Backing track · {Math.round(instGain * 100)}%
           <input
@@ -454,17 +486,31 @@ function ExportPanel({
           />
         </label>
         <label className="text-sm text-muted-foreground">
-          Vocals · {Math.round(vocGain * 100)}%
+          Your mic take · {Math.round(micGain * 100)}%
           <input
             type="range"
             min={0}
             max={1.5}
             step={0.05}
-            value={vocGain}
-            onChange={(e) => setVocGain(Number(e.target.value))}
+            value={micGain}
+            onChange={(e) => setMicGain(Number(e.target.value))}
             className="mt-2 w-full"
           />
         </label>
+        {vocalStemUrl && (
+          <label className="text-sm text-muted-foreground">
+            Original vocals · {Math.round(stemGain * 100)}%
+            <input
+              type="range"
+              min={0}
+              max={1.5}
+              step={0.05}
+              value={stemGain}
+              onChange={(e) => setStemGain(Number(e.target.value))}
+              className="mt-2 w-full"
+            />
+          </label>
+        )}
       </div>
       <div className="flex flex-wrap gap-3">
         <button className={btnGhost} onClick={togglePreview}>

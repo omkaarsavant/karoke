@@ -1,22 +1,48 @@
 export interface MixOptions {
   instrumentalGain: number; // 0..1.5
-  vocalGain: number; // 0..1.5
+  vocalStemGain: number; // 0..1.5
+  microphoneGain: number; // 0..1.5
   /** Seconds into the instrumental at which the vocal recording began. */
   vocalOffset: number;
 }
 
 async function decode(ctx: BaseAudioContext, data: Blob | string): Promise<AudioBuffer> {
-  const buf = typeof data === "string" ? await (await fetch(data)).arrayBuffer() : await data.arrayBuffer();
+  let buf: ArrayBuffer;
+  if (typeof data === "string") {
+    const response = await fetch(data);
+    if (!response.ok) throw new Error(`Couldn't load audio track (${response.status}).`);
+    buf = await response.arrayBuffer();
+  } else {
+    buf = await data.arrayBuffer();
+  }
   return ctx.decodeAudioData(buf);
 }
 
-/** Render instrumental + vocal into a single stereo AudioBuffer, preserving relative timing. */
-export async function mixTracks(instrumentalUrl: string, vocal: Blob, opts: MixOptions): Promise<AudioBuffer> {
+/** Render instrumental, optional original vocal stem, and microphone take into one stereo buffer. */
+export async function mixTracks(
+  instrumentalUrl: string,
+  microphoneTake: Blob,
+  opts: MixOptions,
+  vocalStemUrl?: string,
+): Promise<AudioBuffer> {
   const tmp = new AudioContext();
-  const [inst, voc] = await Promise.all([decode(tmp, instrumentalUrl), decode(tmp, vocal)]);
-  await tmp.close();
+  let inst: AudioBuffer;
+  let mic: AudioBuffer;
+  let stem: AudioBuffer | undefined;
+  try {
+    [inst, mic, stem] = await Promise.all([
+      decode(tmp, instrumentalUrl),
+      decode(tmp, microphoneTake),
+      vocalStemUrl ? decode(tmp, vocalStemUrl) : Promise.resolve(undefined),
+    ]);
+  } finally {
+    await tmp.close();
+  }
+
   const sampleRate = inst.sampleRate;
-  const length = Math.ceil(Math.max(inst.duration, opts.vocalOffset + voc.duration) * sampleRate);
+  const length = Math.ceil(
+    Math.max(inst.duration, stem?.duration ?? 0, opts.vocalOffset + mic.duration) * sampleRate,
+  );
   const ctx = new OfflineAudioContext(2, length, sampleRate);
 
   const add = (buffer: AudioBuffer, gain: number, when: number) => {
@@ -28,7 +54,8 @@ export async function mixTracks(instrumentalUrl: string, vocal: Blob, opts: MixO
     src.start(Math.max(0, when), Math.max(0, -when));
   };
   add(inst, opts.instrumentalGain, 0);
-  add(voc, opts.vocalGain, opts.vocalOffset);
+  if (stem) add(stem, opts.vocalStemGain, 0);
+  add(mic, opts.microphoneGain, opts.vocalOffset);
 
   const out = await ctx.startRendering();
   // soft-limit to avoid clipping
